@@ -1,0 +1,571 @@
+# -*- coding: utf-8 -*
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import time
+import os
+import pdb
+import random
+import math
+import sys
+import pickle
+
+import threading
+import numpy as np
+import tensorflow as tf
+from ortools.graph import pywrapgraph
+from dict_adjuster import dict_adjuster
+from data_util import *
+
+flags = tf.app.flags
+logging = tf.logging
+
+flags.DEFINE_string(
+		"model", "small",
+		"A type of model. Possible options are: small, medium, large.")
+flags.DEFINE_string("data_path", "data", "data_path")
+flags.DEFINE_string("dataset", "ptb", "The dataset we use for training")
+flags.DEFINE_string("model_dir", "model", "model_path")
+
+# Flags for defining the tf.train.ClusterSpec
+flags.DEFINE_string("ps_hosts", "", "Comma-separated list of hostname:port pairs")
+flags.DEFINE_string("worker_hosts", "", "Comma-separated list of hostname:port pairs")
+# Flags for defining the tf.train.Server
+flags.DEFINE_string("job_name", "", "One of 'ps', 'worker'")
+flags.DEFINE_integer("task_index", 0, "Index of task within the job")
+
+flags.DEFINE_integer('num_layers', 1, 'Number of layers in RNN')
+flags.DEFINE_integer('num_steps', 20, 'Number of steps for BPTT')
+flags.DEFINE_integer('hidden_size', 512, 'Number of hidden nodes for one layer')
+flags.DEFINE_integer('max_adjust_iters', 10, 'Number of dictionary adjustion before stop')
+flags.DEFINE_integer('batch_size', 256, 'Number of lines in one batch for training')
+flags.DEFINE_integer('vocab_size', 10000, 'Size of vocabulary')
+flags.DEFINE_integer('lightrnn_size', 100, 'Size of row and column vector to represent the word')
+flags.DEFINE_integer('thread_num', 10, 'num of thread per queue')
+flags.DEFINE_integer('top_num', 3, 'num of top candidates when calculate accuracy')
+flags.DEFINE_float("lr_decay_factor", 0.5, "The decay factor for learning rate")
+flags.DEFINE_float("initial_lr", 1.0, "The initial learning rate for training model")
+flags.DEFINE_float("lstm_keep_prob", 0.5, "The keep rate for lstm layers")
+flags.DEFINE_float("input_keep_prob", 0.8, "The keep rate for input layer")
+flags.DEFINE_float("max_grad_norm", 1.0, "The max norm that clip the gradients")
+flags.DEFINE_float("converge_rate", 0.01, "The converge rate the we tell the training is converged")
+flags.DEFINE_bool("use_adam", True, "Use AdamOptimizer as training optimizer")
+flags.DEFINE_bool("use_fp16", False, "Train using 16-bit floats instead of 32bit floats")
+
+flags.DEFINE_bool("save", False, "Save model")
+flags.DEFINE_bool("restore", False, "Restore model")
+flags.DEFINE_bool("predict", False, "Prediction topK")
+flags.DEFINE_bool("train", True, "TrainModel Flag")
+FLAGS = flags.FLAGS
+
+
+def data_type():
+	return tf.float16 if FLAGS.use_fp16 else tf.float32
+
+class CustomQueue(object):
+	def __init__(self, mode):
+		self.mode = mode
+		self.x_r = tf.placeholder(dtype=tf.int32, shape=[FLAGS.batch_size, FLAGS.num_steps])
+		self.x_c = tf.placeholder(dtype=tf.int32, shape=[FLAGS.batch_size, FLAGS.num_steps])
+		self.y_r = tf.placeholder(dtype=tf.int32, shape=[FLAGS.batch_size, FLAGS.num_steps])
+		self.y_c = tf.placeholder(dtype=tf.int32, shape=[FLAGS.batch_size, FLAGS.num_steps])
+		self.y = tf.placeholder(dtype=tf.int32, shape=[FLAGS.batch_size, FLAGS.num_steps])
+			
+		# The actual queue of data. The queue contains a vector for
+		# the mnist features, and a scalar label.
+		self.queue = tf.FIFOQueue(capacity=100, dtypes=[tf.int32, tf.int32, tf.int32, tf.int32, tf.int32], shapes=[[FLAGS.batch_size, FLAGS.num_steps],[FLAGS.batch_size, FLAGS.num_steps], [FLAGS.batch_size, FLAGS.num_steps], [FLAGS.batch_size, FLAGS.num_steps], [FLAGS.batch_size, FLAGS.num_steps]], shared_name="{0}_shared_queue".format(mode))
+		self.enqueue_op = self.queue.enqueue([self.x_r, self.x_c, self.y_r, self.y_c, self.y])
+		self.dequeue_data = self.queue.dequeue()
+		self.close_queue = self.queue.close(cancel_pending_enqueues=True)
+		self.queue_size = self.queue.size()
+	
+	def feed_queue_data(self, reader, data, step_num, sess, sv):
+		batch_generator = reader.get_next_batch(data, step_num)	
+		while not sv.should_stop():
+			try:
+				x_r, x_c, y_r, y_c, y = batch_generator.next()
+				sess.run(self.enqueue_op, feed_dict={self.x_r:x_r, self.x_c:x_c, self.y_r:y_r, self.y_c:y_c, self.y:y})
+				#print("queue size is %d" % sess.run(queue.queue_size))
+			except StopIteration:
+				#print("data finished for one epoch")
+				batch_generator = reader.get_next_batch(data, step_num)	
+				pass
+
+class LightRNN(object):
+	def __init__(self, mode, queue, reuse=None):
+		self.mode = mode
+		self.queue = queue
+		if mode == "train":
+			self.is_training = True
+			self.batch_size = FLAGS.batch_size
+			self.input_keep_prob = FLAGS.input_keep_prob
+			self.lstm_keep_prob = FLAGS.lstm_keep_prob
+		elif mode == "valid":
+			self.is_training = True
+			self.batch_size = FLAGS.batch_size
+			self.input_keep_prob = FLAGS.input_keep_prob
+			self.lstm_keep_prob = FLAGS.lstm_keep_prob
+		elif mode == "test":
+			self.is_training = False
+			self.batch_size = FLAGS.batch_size
+			self.input_keep_prob = 1.0
+			self.lstm_keep_prob = 1.0
+
+		with tf.variable_scope("model", reuse=reuse):
+			input_data_r, input_data_c, target_r, target_c, target = self.queue.dequeue_data
+			#input_data_rc = tf.placeholder(tf.int32, [self.batch_size])
+			stdv = np.sqrt(1. / FLAGS.vocab_size)
+			embedding_r = tf.get_variable("embedding_r", [FLAGS.lightrnn_size, FLAGS.hidden_size], initializer=tf.random_uniform_initializer(-stdv, stdv))
+			embedding_c = tf.get_variable("embedding_c", [FLAGS.lightrnn_size, FLAGS.hidden_size], initializer=tf.random_uniform_initializer(-stdv, stdv))
+
+			inputs_r = tf.nn.embedding_lookup(embedding_r, input_data_r)
+			inputs_c = tf.nn.embedding_lookup(embedding_c, input_data_c)
+			inputs_r = tf.nn.dropout(inputs_r, self.input_keep_prob) 
+			inputs_c = tf.nn.dropout(inputs_c, self.input_keep_prob) 
+			
+			lstm_cell = tf.contrib.rnn.BasicLSTMCell(FLAGS.hidden_size, forget_bias=1.0, state_is_tuple=True) 
+			lstm_cell = tf.contrib.rnn.DropoutWrapper(lstm_cell, output_keep_prob=self.lstm_keep_prob)
+			cell = tf.contrib.rnn.MultiRNNCell([lstm_cell] * FLAGS.num_layers, state_is_tuple=True)
+			self.initial_state = cell.zero_state(self.batch_size, data_type())
+			state_c = self.initial_state
+		
+			softmax_w_r = tf.get_variable("softmax_w_r", [FLAGS.hidden_size, FLAGS.lightrnn_size], dtype=data_type())
+			softmax_b_r = tf.get_variable("softmax_b_r", [FLAGS.lightrnn_size], dtype=data_type())
+			softmax_w_c = tf.get_variable("softmax_w_c", [FLAGS.hidden_size, FLAGS.lightrnn_size], dtype=data_type())
+			softmax_b_c = tf.get_variable("softmax_b_c", [FLAGS.lightrnn_size], dtype=data_type())
+		
+			cell_outputs_r = []
+			cell_outputs_c = []
+			with tf.variable_scope("RNN"):
+				for time_step in range(FLAGS.num_steps):
+					if time_step > 0: tf.get_variable_scope().reuse_variables()
+					
+					cell_output_c, state_r = cell(inputs_r[:,time_step,:], state_c)
+					
+					tf.get_variable_scope().reuse_variables()
+					cell_output_r, state_c = cell(inputs_c[:,time_step,:], state_r)
+					
+					outputs_r = tf.matmul(cell_output_r, softmax_w_r) + softmax_b_r
+					input_data_rc = tf.argmax(outputs_r, 1, name="input_data_rc")
+					inputs_rc = tf.nn.embedding_lookup(embedding_r, input_data_rc)
+					inputs_rc = tf.nn.dropout(inputs_rc, self.input_keep_prob)
+					
+					tf.get_variable_scope().reuse_variables()	
+					cell_output_c, state_r = cell(inputs_rc, state_c)
+					outputs_c = tf.matmul(cell_output_c, softmax_w_c) + softmax_b_c
+				
+					cell_outputs_r.append(outputs_r)
+					cell_outputs_c.append(outputs_c)
+
+			# Evaluate model
+			logits_r = tf.reshape(tf.concat(axis=1, values=cell_outputs_r), [-1, FLAGS.lightrnn_size])
+			logits_c = tf.reshape(tf.concat(axis=1, values=cell_outputs_c), [-1, FLAGS.lightrnn_size])
+			output_loss_r = -tf.nn.log_softmax(logits_r)
+			output_loss_c = -tf.nn.log_softmax(logits_c)
+				
+			batch_loss_r = tf.reshape(output_loss_r, [FLAGS.num_steps*self.batch_size, FLAGS.lightrnn_size, 1])
+			batch_loss_r = tf.tile(batch_loss_r, [1, 1, FLAGS.lightrnn_size])
+			batch_loss_r = tf.reshape(batch_loss_r, [FLAGS.num_steps*self.batch_size, -1])
+
+			batch_loss_c = tf.tile(output_loss_c, [1, FLAGS.lightrnn_size])
+			self.batch_loss = batch_loss_r + batch_loss_c
+			
+			loss_r = tf.contrib.seq2seq.sequence_loss(
+							 tf.reshape(logits_r, [self.batch_size, FLAGS.num_steps, -1]),
+							 tf.reshape(target_r, [self.batch_size, FLAGS.num_steps]),
+							 tf.ones([self.batch_size, FLAGS.num_steps], dtype=data_type()))
+			loss_c = tf.contrib.seq2seq.sequence_loss(
+							 tf.reshape(logits_c, [self.batch_size, FLAGS.num_steps, -1]),
+							 tf.reshape(target_c, [self.batch_size, FLAGS.num_steps]),
+							 tf.ones([self.batch_size, FLAGS.num_steps], dtype=data_type()))
+			self.loss = loss_r + loss_c
+
+			self.lr = tf.get_variable('lr', [], initializer=tf.constant_initializer(FLAGS.initial_lr), trainable=False)
+			self.new_lr = tf.placeholder(tf.float32, shape=[], name="new_learning_rate")
+			self.lr_decay_op = self.lr.assign(self.new_lr)
+			self.lr_init_op = self.lr.assign(FLAGS.initial_lr)
+
+			tvars = tf.trainable_variables()
+			grads, _ = tf.clip_by_global_norm(tf.gradients(self.loss, tvars), FLAGS.max_grad_norm)
+
+			if FLAGS.use_adam:	
+				opt = tf.train.AdamOptimizer(use_locking=True) # Adam Optimizer
+			else:	
+				opt = tf.train.GradientDescentOptimizer(learning_rate=self.lr)
+	
+			self.train_op = opt.apply_gradients(zip(grads, tvars))
+			
+			top_k=tf.nn.in_top_k(-self.batch_loss, tf.reshape(target, [-1]), FLAGS.top_num)  
+			self.accuracy = tf.reduce_mean(tf.cast(top_k, tf.float32))
+
+			if self.is_training:
+				self.pred_topK = tf.no_op()
+			else:
+				_, self.pred_topK = tf.nn.top_k(-self.batch_loss, FLAGS.top_num)
+
+			self.model_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='model')
+			self.model_init_op = tf.variables_initializer(self.model_variables)
+		
+		with tf.variable_scope("loss_matrix", reuse=reuse):
+			self.loss_matrix_r = tf.get_variable("loss_matrix_r", [FLAGS.vocab_size, FLAGS.lightrnn_size], initializer=tf.constant_initializer(0.0), dtype=data_type(), trainable=False)
+			self.loss_matrix_c = tf.get_variable("loss_matrix_c", [FLAGS.vocab_size, FLAGS.lightrnn_size], initializer=tf.constant_initializer(0.0), dtype=data_type(), trainable=False)
+		
+			loss_matrix_update_r = tf.scatter_add(self.loss_matrix_r, tf.reshape(target, [-1]), output_loss_r, use_locking=True)
+			loss_matrix_update_c = tf.scatter_add(self.loss_matrix_c, tf.reshape(target, [-1]), output_loss_c, use_locking=True)
+			self.loss_matrix_update_op = tf.group(loss_matrix_update_r, loss_matrix_update_c)
+			self.loss_matrix_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='loss_matrix')
+			self.loss_matrix_init_op = tf.variables_initializer(self.loss_matrix_variables)
+
+	def init_model(self, sess):
+		sess.run(self.model_init_op)
+
+	def update_lr(self, sess, new_lr):
+		if self.is_training:
+			sess.run(self.lr_decay_op, feed_dict={self.new_lr: new_lr})	
+
+
+
+def main(_):
+	ps_hosts = FLAGS.ps_hosts.split(",")
+	worker_hosts = FLAGS.worker_hosts.split(",")
+	worker_num = len(worker_hosts)
+	
+	reader = Reader(FLAGS.data_path, FLAGS.dataset, FLAGS.vocab_size, FLAGS.batch_size, FLAGS.num_steps)
+	train_path = os.path.join(FLAGS.data_path, FLAGS.dataset, "%s.train2.txt" % FLAGS.dataset)
+	valid_path = os.path.join(FLAGS.data_path, FLAGS.dataset, "%s.valid2.txt" % FLAGS.dataset)
+	test_path = os.path.join(FLAGS.data_path, FLAGS.dataset, "%s.test2.txt" % FLAGS.dataset)
+	# Create a cluster from the parameter server and worker hosts.
+	cluster = tf.train.ClusterSpec({ "ps": ps_hosts, "worker" : worker_hosts })
+	
+	# start a server for a specific task
+	server = tf.train.Server(cluster, 
+														job_name=FLAGS.job_name,
+														task_index=FLAGS.task_index)
+		
+	if FLAGS.job_name == "ps":
+		server.join()
+	elif FLAGS.job_name == "worker":
+		is_chief = FLAGS.task_index == 0
+		with tf.device("/job:ps/task:0"):
+			train_queue = CustomQueue("train")
+			valid_queue = CustomQueue("valid")
+			test_queue = CustomQueue("test")
+
+		with tf.device(tf.train.replica_device_setter(
+					worker_device="/job:worker/task:%d" % FLAGS.task_index,
+					cluster=cluster)): 
+			# Create global variables and ops
+			with tf.variable_scope("global"):
+				# Define training variables and ops
+				global_step = tf.Variable(tf.constant(0), dtype=tf.int32, trainable=False, name="global_step")
+				global_valid_ppl = tf.Variable(tf.constant(0.0), dtype=tf.float32, trainable=False, name="global_valid_ppl")
+				global_test_ppl = tf.Variable(tf.constant(0.0), dtype=tf.float32, trainable=False, name="global_test_ppl")
+				global_test_acc = tf.Variable(tf.constant(0.0), dtype=tf.float32, trainable=False, name="global_test_acc")
+				
+				vppl = tf.placeholder(tf.float32, shape=[], name="vppl")
+				tppl = tf.placeholder(tf.float32, shape=[], name="tppl")
+				tacc = tf.placeholder(tf.float32, shape=[], name="tacc")
+				increment_valid_ppl = tf.assign_add(global_valid_ppl, vppl, use_locking=True)
+				increment_test_ppl = tf.assign_add(global_test_ppl, tppl, use_locking=True)
+				increment_test_acc = tf.assign_add(global_test_acc, tacc, use_locking=True)
+				init_valid_ppl = global_valid_ppl.assign(0.0)
+				init_test_ppl = global_test_ppl.assign(0.0)
+				init_test_acc = global_test_acc.assign(0.0)
+				
+				counter1 = tf.Variable(tf.constant(0), dtype=tf.int32, trainable=False, name="counter1")
+				counter2 = tf.Variable(tf.constant(0), dtype=tf.int32, trainable=False, name="counter2")
+				counter3 = tf.Variable(tf.constant(0), dtype=tf.int32, trainable=False, name="counter3")
+				increment_counter1 = tf.assign_add(counter1, 1, use_locking=True)
+				increment_counter2 = tf.assign_add(counter2, 1, use_locking=True)
+				increment_counter3 = tf.assign_add(counter3, 1, use_locking=True)
+				
+			# Create model
+			print("Creating %d layers of %d units." % (FLAGS.num_layers, FLAGS.hidden_size))
+			train_model = LightRNN("train", train_queue, reuse=False)
+			valid_model = LightRNN("valid", valid_queue, reuse=True)
+			test_model = LightRNN("test", test_queue, reuse=True)
+		
+			#pdb.set_trace()	
+			#remove_variables = [loss_matrix_r, loss_matrix_c]
+			#all_variables_to_save = [i for i in tf.all_variables() if i not in remove_variables and "Adam" not in i.name]
+			#my_saver = tf.train.Saver(all_variables_to_save)	
+			my_saver = tf.train.Saver(tf.global_variables())
+	
+			init_op = tf.global_variables_initializer()
+		
+		print("Variables initialized ...")
+		sv = tf.train.Supervisor(is_chief=(FLAGS.task_index == 0),
+															global_step=global_step,
+															init_op=init_op,
+															saver=my_saver)
+		epoch = 0	
+		for adjust_iter in range(FLAGS.max_adjust_iters):
+			sess_config = tf.ConfigProto(allow_soft_placement = True, log_device_placement=False)
+			with sv.prepare_or_wait_for_session(server.target, config = sess_config) as sess:
+				print("queue size is %d" % sess.run(train_queue.queue_size))
+				if adjust_iter == 0 and FLAGS.restore:
+					ckpt = tf.train.get_checkpoint_state(FLAGS.model_dir)
+					if ckpt and tf.gfile.Exists(ckpt.model_checkpoint_path): 
+						print("Reading model parameters from %s" % ckpt.model_checkpoint_path)
+						my_saver.restore(sess, ckpt.model_checkpoint_path)
+					else:
+						print("No checkpoint file found!")
+
+				print("start training with new wordid2id")
+				train_data, train_step_per_thread, train_step_per_worker = reader.read_file(train_path, worker_num, FLAGS.thread_num)
+				valid_data, valid_step_per_thread, valid_step_per_worker = reader.read_file(valid_path, worker_num, FLAGS.thread_num)
+				test_data, test_step_per_thread, test_step_per_worker = reader.read_file(test_path, worker_num, FLAGS.thread_num)
+				
+				if is_chief:
+					# The number of threads is the same as the number of workers
+					threads = []
+					for i in range(FLAGS.thread_num):
+						t = threading.Thread(target=train_queue.feed_queue_data, args=(reader, train_data[i], train_step_per_thread, sess, sv))
+						threads.append(t)
+						t = threading.Thread(target=valid_queue.feed_queue_data, args=(reader, valid_data[i], valid_step_per_thread, sess, sv))
+						threads.append(t)
+						t = threading.Thread(target=test_queue.feed_queue_data, args=(reader, test_data[i], test_step_per_thread, sess, sv))
+						threads.append(t)
+
+					for thread in threads:
+						thread.daemon = True
+						thread.start()
+
+				ppl_history = []
+				do_adjustion = False
+				while not do_adjustion:
+					print("I'm worker %d and I'm working on epoch %d." %(FLAGS.task_index, epoch))
+					loss = 0.0
+					step = 0
+					start_time = time.time()
+					while not sv.should_stop() and step < train_step_per_worker:
+						#print(sess.run(train_queue.queue_size))
+						loss_val, _ = sess.run([train_model.loss, train_model.train_op])
+						loss += loss_val
+						step += 1
+					train_ppl = np.exp(loss / step)
+					print("TaskID:%d, Train epoch: %d lr:%f Train Perplexity: %.4f speed: %.0f wps"% (FLAGS.task_index, epoch, train_model.lr.eval(), train_ppl, step*FLAGS.num_steps*FLAGS.batch_size/(time.time()-start_time)))
+					
+					# test the ppl with valid data
+					loss = 0.0
+					step = 0
+					while not sv.should_stop() and step < valid_step_per_worker:
+						loss_val = sess.run(valid_model.loss)
+						loss += loss_val
+						step += 1
+					valid_ppl=np.exp(loss / step)		
+					
+					# test the ppl and accuracy with test data
+					loss = 0.0
+					step = 0
+					acc_list = []
+					while not sv.should_stop() and step < test_step_per_worker:
+						loss_val, step_acc = sess.run([test_model.loss, test_model.accuracy])
+						acc_list.append(step_acc)
+						loss += loss_val
+						step += 1
+					test_ppl = np.exp(loss / step)
+					test_acc = sum(acc_list)/len(acc_list)
+					
+					sess.run(increment_valid_ppl, feed_dict={vppl: valid_ppl/worker_num})	
+					sess.run(increment_test_ppl, feed_dict={tppl: test_ppl/worker_num})
+					sess.run(increment_test_acc, feed_dict={tacc: test_acc/worker_num})	
+					sess.run(increment_counter1)
+					while counter1.eval() % worker_num:
+						pass
+					
+					if is_chief:	
+						print("TaskID:%d, Valid epoch:%d, Valid-PPL: %.2f" % (FLAGS.task_index, epoch, global_valid_ppl.eval()))
+						print("TaskID:%d, Test epoch:%d, Test-PPL: %.2f, Test-Accuracy: %.4f" % (FLAGS.task_index, epoch, global_test_ppl.eval(), global_test_acc.eval()))
+						# If valid data performs bad, decay learning rate
+						current_lr = train_model.lr.eval()
+						if not FLAGS.use_adam and current_lr > 0.005 and len(ppl_history) > 2 and global_valid_ppl.eval() > max(ppl_history[-3:]):
+							current_lr *= FLAGS.lr_decay_factor
+							train_model.update_lr(sess, current_lr)
+	
+					epoch += 1
+					# If converged, do dictionary adjustion
+					if epoch == 1:
+					#if epoch > 0 and epoch % 10 == 0:
+					#if(len(ppl_history) >= 3 and global_valid_ppl.eval() > max(ppl_history[-3:])):
+					#if len(ppl_history) >= 2 and global_valid_ppl.eval() > ppl_history[-1]:
+					#if len(ppl_history) >= 5 and (global_valid_ppl.eval() * FLAGS.converge_rate > max(ppl_history[-5:])-min(ppl_history[-5:]) or global_valid_ppl.eval() > max(ppl_history[-5:])):
+						do_adjustion = True	
+						
+					ppl_history.append(global_valid_ppl.eval())	
+					
+					sess.run(increment_counter2)
+					while counter2.eval() % worker_num:
+						pass
+					
+					if is_chief:
+						sess.run(init_valid_ppl)
+						sess.run(init_test_ppl)
+						sess.run(init_test_acc)	
+						print("queue size is %d" % sess.run(train_queue.queue_size))
+				
+				print("preparing loss matrix...")
+				# One more epoch to get the loss matrix for dictionary adjustion
+				step = 0
+				while not sv.should_stop() and step < train_step_per_worker:
+					sess.run(train_model.loss_matrix_update_op)
+					step += 1
+				print("I'm done %d" % FLAGS.task_index)
+				sess.run(increment_counter3)
+				while counter3.eval() % worker_num:
+					pass
+				
+				if is_chief:
+					#sess.run(train_model.model_init_op)
+					if FLAGS.save:
+						print("Saving model...")
+						my_saver.save(sess, checkpoint_path, global_step=epoch-1)
+						print("Finish saving model.")		
+					
+					# Stop threads here	
+					#sv.request_stop()
+					#for thread in threads:
+					#	thread.join()
+			
+				_loss_matrix_r = train_model.loss_matrix_r.eval()
+				_loss_matrix_c = train_model.loss_matrix_c.eval()
+			
+				sess.run(increment_counter3)
+				while counter3.eval() % worker_num:
+					pass
+				
+				if is_chief:
+					#sess.run(train_model.model_init_op)
+					sess.run(train_model.loss_matrix_init_op)
+					
+			pdb.set_trace()
+			# This is where the session ends	
+			_loss_matrix_r = np.repeat(_loss_matrix_r, FLAGS.lightrnn_size, axis=1)
+			_loss_matrix_c = np.tile(_loss_matrix_c, [1, FLAGS.lightrnn_size])
+			_loss_matrix = _loss_matrix_r + _loss_matrix_c
+			matrix = []
+			# Not sure that transpose of r add c works...
+			for i in range(FLAGS.vocab_size):
+				# ortools only takes integer argument!
+				row = (_loss_matrix[i]*100).astype(int).tolist() 
+				matrix.append(row)
+			print("preparing matrix takes %.2f seconds" % (time.time()-start_time))
+			print("start adjusting...")
+			# Use ortools to optimize the dictionary
+			assignment = pywrapgraph.LinearSumAssignment()
+			original_total_cost = 0
+			#pdb.set_trace()
+			start_time = time.time()
+			for worker in range(FLAGS.vocab_size):
+				for task in range(FLAGS.vocab_size):
+					if worker == task:
+						original_total_cost += matrix[worker][task]
+					assignment.AddArcWithCost(worker, task, matrix[worker][task])
+			solve_status = assignment.Solve()
+			if solve_status == assignment.OPTIMAL:
+				id2wordid = np.zeros(FLAGS.vocab_size, dtype=np.int32)
+				for i in range(FLAGS.vocab_size):
+					id2wordid[reader.wordid2r[i] * FLAGS.lightrnn_size + reader.wordid2c[i]] = i
+				total_adjustion = 0
+				for i in range(0, assignment.NumNodes()):
+					true_id = id2wordid[i]
+					reader.wordid2r[true_id] = assignment.RightMate(i) // FLAGS.lightrnn_size		
+					reader.wordid2c[true_id] = assignment.RightMate(i) % FLAGS.lightrnn_size		
+					if assignment.RightMate(i) != i:
+						total_adjustion += 1	
+				print("takes %.2f seconds, original_total_cost is %.2f, total_loss is %.2f, total_adjustion is %d." % (
+																																					time.time()-start_time, 
+																																					original_total_cost, 
+																																					assignment.OptimalCost(), 
+																																					total_adjustion))
+				#	print('Worker %d assigned to task %d.  Cost = %d' % (i, assignment.RightMate(i), assignment.AssignmentCost(i)))
+			elif solve_status == assignment.INFEASIBLE:
+				print('No assignment is possible.')
+			elif solve_status == assignment.POSSIBLE_OVERFLOW:
+				print('Some input costs are too large and may cause an integer overflow.')
+			"""	
+			# Use my dict_adjuster to optimize the dictionary
+			print("start adjustion...")
+			#pdb.set_trace()
+			original_total_cost = 0
+			start_time = time.time()
+			for i in range(FLAGS.vocab_size):
+				original_total_cost += _loss_matrix_r[i][i//FLAGS.lightrnn_size]
+				original_total_cost += _loss_matrix_c[i][i%FLAGS.lightrnn_size]
+			adj = dict_adjuster(_loss_matrix_r, _loss_matrix_c, current_wordid2r, current_wordid2c)
+			current_wordid2r, current_wordid2c, total_loss, total_adjustion = adj.appx_adjust()
+			print("takes %.2f seconds, original_total_cost is %.2f, total_loss is %.2f, total_adjustion is %d." % (
+																																						time.time()-start_time, 
+																																						original_total_cost,
+																																						total_loss, 
+																																						total_adjustion))
+			"""
+
+
+
+
+"""
+def predict():
+	reader = Reader(FLAGS.data_path, FLAGS.dataset, FLAGS.vocab_size, FLAGS.batch_size, FLAGS.num_steps)
+	model = LightRNN(False)
+	wordid2r = tf.get_variable("wordid2r", [FLAGS.vocab_size], dtype=tf.int32, initializer=tf.constant_initializer(0), trainable=False) 
+	wordid2c = tf.get_variable("wordid2c", [FLAGS.vocab_size], dtype=tf.int32, initializer=tf.constant_initializer(0), trainable=False) 
+	
+	init_op = tf.initialize_all_variables()
+	with tf.Session() as sess:
+		sess.run(init_op)
+		ckpt = tf.train.get_checkpoint_state(FLAGS.model_dir)
+		if ckpt and tf.gfile.Exists(ckpt.model_checkpoint_path): 
+			print("Reading model parameters from %s" % ckpt.model_checkpoint_path)
+			model.saver.restore(sess, ckpt.model_checkpoint_path)
+		else:
+			print("No checkpoint file found!")
+		
+		id2wordid = np.zeros(FLAGS.vocab_size, dtype=np.int32)
+		reader.wordid2r = wordid2r.eval()
+		reader.wordid2c = wordid2c.eval()
+		for i in range(FLAGS.vocab_size):
+			id2wordid[reader.wordid2r[i] * FLAGS.lightrnn_size + reader.wordid2c[i]] = i
+		sen_input = raw_input("input: ")
+		while sen_input:
+			inputs=[]
+			#print (sen_input)
+			sen_input = sen_input.split()
+			for word in sen_input:
+				#print (word)
+				if(reader.word2id.has_key(word)):
+					inputs.append(reader.word2id.get(word)) 
+			#print(inputs)
+			sen_len = len(inputs)
+			if sen_len > 0:
+				for step, (x_r, x_c) in enumerate(reader.get_one_sentence(inputs)):
+					feed_dict = {}
+					feed_dict[model.input_data_r] = x_r
+					feed_dict[model.input_data_c] = x_c
+					feed_dict[model.lstm_keep_prob] = 1.0
+					feed_dict[model.input_keep_prob] = 1.0
+					fetches = model.pred_topK
+					#fetches = [pred_topK_r, pred_topK_c]
+					value = sess.run(fetches, feed_dict)
+					#pdb.set_trace()					
+					#print (type(output_val))
+					print (value)
+					print("top 3 answers are:")
+					for ii in xrange(len(value[-1])):
+						key = value[-1][ii]
+						#print (value[-1][ii], key)
+						val = id2wordid[key]
+						#print ("val:%d"%val)
+						print(" %s " % reader.vocab.words[val])
+			sen_input = raw_input("input: ")
+							
+def main(_):
+	if FLAGS.train:
+		train()
+	if FLAGS.predict:
+		predict()
+"""
+if __name__ == "__main__":
+	tf.app.run()
+
